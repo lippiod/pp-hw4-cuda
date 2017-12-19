@@ -20,7 +20,7 @@ int main(int argc, char* argv[])
 
 	input(argv[1]);
 	int B = atoi(argv[3]);
-	block_FW(B);
+	//block_FW(B);
 
 	output(argv[2]);
 
