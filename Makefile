@@ -1,4 +1,4 @@
-NVFLAGS  := -std=c++11
+NVFLAGS  := -std=c++11 -g
 
 CXXFLAGS := -fopenmp
 

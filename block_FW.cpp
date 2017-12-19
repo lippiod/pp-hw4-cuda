@@ -1,11 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include "io.hpp"
 #include <assert.h>
 
 #define ceil(a, b) ( ((a) + (b) - 1) / (b) )
+#define INF 1000000000
+#define V   20500
 
-
+void input(char *inFileName);
+void output(char *outFileName);
 void block_FW(int B);
 bool cal(int B, int Round, int block_start_x, int block_start_y, int block_width, int block_height);
 
@@ -16,11 +18,11 @@ int main(int argc, char* argv[])
 {
     assert(argc==4);
 
-	input(argv[1], Dist, &n);
+	input(argv[1]);
 	int B = atoi(argv[3]);
 	block_FW(B);
 
-	output(argv[2], Dist, n);
+	output(argv[2]);
 
 	return 0;
 }
@@ -35,23 +37,19 @@ void block_FW(int B)
         int done = true;
 		done &= cal(B,	r,	r,	r,	1,	1);
 
-		/* Phase 2*/
+        // Phase 2
 		done &= cal(B, r,     r,     0,             r,             1);
 		done &= cal(B, r,     r,  r +1,  round - r -1,             1);
 		done &= cal(B, r,     0,     r,             1,             r);
 		done &= cal(B, r,  r +1,     r,             1,  round - r -1);
 
-		/* Phase 3*/
+		// Phase 3
 		done &= cal(B, r,     0,     0,            r,             r);
 		done &= cal(B, r,     0,  r +1,  round -r -1,             r);
 		done &= cal(B, r,  r +1,     0,            r,  round - r -1);
 		done &= cal(B, r,  r +1,  r +1,  round -r -1,  round - r -1);
-/*
-        if (done)
-            break;
-*/
-	}
 
+	}
 }
 
 bool cal(int B, int Round, int block_start_x, int block_start_y, int block_width, int block_height)
@@ -89,4 +87,36 @@ bool cal(int B, int Round, int block_start_x, int block_start_y, int block_width
     return done;
 }
 
+void input(char *inFileName)
+{
+    int m;
+	FILE *infile = fopen(inFileName, "r");
+	fscanf(infile, "%d %d", &n, &m);
 
+	for (int i = 0; i < V; ++i) {
+		for (int j = 0; j < V; ++j) {
+			if (i == j)	Dist[i][j] = 0;
+			else		Dist[i][j] = INF;
+		}
+	}
+
+	while (--m >= 0) {
+		int a, b, v;
+		fscanf(infile, "%d %d %d", &a, &b, &v);
+		Dist[a][b] = v;
+	}
+    fclose(infile);
+}
+
+void output(char *outFileName)
+{
+	FILE *outfile = fopen(outFileName, "w");
+	for (int i = 0; i < n; ++i) {
+		for (int j = 0; j < n; ++j) {
+            if (Dist[i][j] >= INF)
+                Dist[i][j] = INF;
+		}
+		fwrite(Dist[i], sizeof(int), n, outfile);
+	}
+    fclose(outfile);
+}
