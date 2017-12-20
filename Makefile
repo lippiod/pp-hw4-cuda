@@ -1,4 +1,4 @@
-NVFLAGS  := -std=c++11 -g -G
+NVFLAGS  := -std=c++11
 
 CXXFLAGS := -fopenmp
 
@@ -9,6 +9,10 @@ MPILIBS  := -I/opt/intel/compilers_and_libraries_2017.3.191/linux/mpi/intel64/in
 EXES     := HW4_cuda HW4_openmp HW4_mpi
 
 alls: $(EXES)
+
+.PHONY: debug
+debug:
+	$(MAKE) NVFLAGS="-std=c++11 -g -G"
 
 clean:
 	rm -f $(EXES)

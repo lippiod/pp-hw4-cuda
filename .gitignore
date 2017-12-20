@@ -1,2 +1,5 @@
 testcase
 submit
+*.csv
+*.out
+*.txt

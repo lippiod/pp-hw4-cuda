@@ -24,22 +24,24 @@ unsigned int *Dist_h;
 char buf[INF];
 char *fstr;
 
-struct timeval start_time, temp_time;
+//struct timeval start_time, temp_time;
 
 unsigned int *Dist_d;
-size_t pitch;
+size_t pitch_d, pitch_int;
+__constant__ unsigned int *Dist;
+__constant__ size_t pitch;
 
 //const int tpb = 1024;
 const int maxBF = 40;
 
-__global__ void cal_phase1(unsigned int *Dist_d, size_t pitch, int round, int pivot)
+__global__ void cal_phase1(int round, int pivot)
 {
     __shared__ unsigned int block_dist[maxBF][maxBF];
 
     int tidx = threadIdx.x, tidy = threadIdx.y;
-    int block_index = pitch * (pivot + tidy) + pivot + tidx;
+    int block_index = pivot + pitch * tidy + tidx;
 
-    block_dist[tidy][tidx] = Dist_d[block_index];
+    block_dist[tidy][tidx] = Dist[block_index];
     __syncthreads();
 
     for(int k=0; k<round; k++) {
@@ -49,47 +51,51 @@ __global__ void cal_phase1(unsigned int *Dist_d, size_t pitch, int round, int pi
         __syncthreads();
     }
 
-    Dist_d[block_index] = block_dist[tidy][tidx];
+    Dist[block_index] = block_dist[tidy][tidx];
 }
 
-__global__ void cal_phase2(unsigned int *Dist_d, size_t pitch, int total, int round, int r)
+__global__ void cal_phase2(int round, int r)
 {
     __shared__ unsigned int block_dist[maxBF][maxBF];
     __shared__ unsigned int pivot_dist[maxBF][maxBF];
 
     int tidx = threadIdx.x, tidy = threadIdx.y;
     int pivot = blockDim.x * r;
+    int py = pitch * (pivot + tidy);
+    int px = pivot + tidx;
     int block_index, pivot_index;
+    unsigned int (*D1)[maxBF], (*D2)[maxBF];
 
     if(blockIdx.x==r) // pivot block
         return;
 
-    pivot_index = pitch * (pivot + tidy) + pivot + tidx;
-    pivot_dist[tidy][tidx] = Dist_d[pivot_index];
+    pivot_index = py + px;
+    pivot_dist[tidy][tidx] = Dist[pivot_index];
 
-    if(blockIdx.y==0) // row pivot
-        block_index = pitch * (pivot + tidy) + blockDim.x * blockIdx.x + tidx;
-    else // column pivot
-        block_index = pitch * (blockDim.x * blockIdx.x + tidy) + pivot + tidx;
-    block_dist[tidy][tidx] = Dist_d[block_index];
+    if(blockIdx.y==0) { // row pivot
+        block_index = py + blockDim.x * blockIdx.x + tidx;
+        D1 = pivot_dist;
+        D2 = block_dist;
+    } else { // column pivot
+        block_index = pitch * (blockDim.x * blockIdx.x + tidy) + px;
+        D1 = block_dist;
+        D2 = pivot_dist;
+    }
+    block_dist[tidy][tidx] = Dist[block_index];
     __syncthreads();
 
     for(int k=0; k<round; k++) {
-        unsigned int new_dist;
-        if(blockIdx.y==0)
-            new_dist = pivot_dist[tidy][k] + block_dist[k][tidx];
-        else
-            new_dist = block_dist[tidy][k] + pivot_dist[k][tidx];
+        unsigned int new_dist = D1[tidy][k] + D2[k][tidx];
 
         if (block_dist[tidy][tidx] > new_dist)
             block_dist[tidy][tidx] = new_dist;
         __syncthreads();
     }
 
-    Dist_d[block_index] = block_dist[tidy][tidx];
+    Dist[block_index] = block_dist[tidy][tidx];
 }
 
-__global__ void cal_phase3(unsigned int *Dist_d, size_t pitch, int total, int round, int r)
+__global__ void cal_phase3(int round, int r)
 {
     __shared__ unsigned int block_dist[maxBF][maxBF];
     __shared__ unsigned int pvRow_dist[maxBF][maxBF];
@@ -103,35 +109,34 @@ __global__ void cal_phase3(unsigned int *Dist_d, size_t pitch, int total, int ro
     if(blockIdx.y==r || blockIdx.x==r) // pivots
         return;
 
-    block_index = pitch * (by + tidy) + bx + tidx;
-    block_dist[tidy][tidx] = Dist_d[block_index];
-
     pvRow_index = pitch * (pv + tidy) + bx + tidx;
-    pvRow_dist[tidy][tidx] = Dist_d[pvRow_index];
+    pvRow_dist[tidy][tidx] = Dist[pvRow_index];
 
     pvCol_index = pitch * (by + tidy) + pv + tidx;
-    pvCol_dist[tidy][tidx] = Dist_d[pvCol_index];
+    pvCol_dist[tidy][tidx] = Dist[pvCol_index];
     __syncthreads();
+
+    block_index = pitch * (by + tidy) + bx + tidx;
+    block_dist[tidy][tidx] = Dist[block_index];
 
     for(int k=0; k<round; k++) {
         unsigned int new_dist = pvCol_dist[tidy][k] + pvRow_dist[k][tidx];
         if (block_dist[tidy][tidx] > new_dist)
             block_dist[tidy][tidx] = new_dist;
-        __syncthreads();
     }
 
-    Dist_d[block_index] = block_dist[tidy][tidx];
+    Dist[block_index] = block_dist[tidy][tidx];
 }
 
-__global__ void set_inf(unsigned int *Dist_d, int pitch)
+__global__ void set_inf()
 {
     int dist_index = pitch * (blockDim.y * blockIdx.y + threadIdx.y) + blockDim.x * blockIdx.x + threadIdx.x;
-    unsigned int value = Dist_d[ dist_index ];
+    unsigned int value = Dist[ dist_index ];
 
     if (value>=INF)
         value = INF;
 
-    Dist_d[ dist_index ] = value;
+    Dist[ dist_index ] = value;
 }
 
 int main(int argc, char* argv[])
@@ -139,21 +144,21 @@ int main(int argc, char* argv[])
     assert(argc==4);
 	B = atoi(argv[3]);
 
-    gettimeofday(&start_time, NULL);
+    //gettimeofday(&start_time, NULL);
 
 	input(argv[1]);
-    gettimeofday(&temp_time, NULL);
-    printf("input> %g s\n", CAL_TIME);
+    //gettimeofday(&temp_time, NULL);
+    //printf("input> %g s\n", CAL_TIME);
 
     //print();
 	block_FW();
-    gettimeofday(&temp_time, NULL);
-    printf("block_FW> %g s\n", CAL_TIME);
+    //gettimeofday(&temp_time, NULL);
+    //printf("block_FW> %g s\n", CAL_TIME);
 
     //print();
 	output(argv[2]);
-    gettimeofday(&temp_time, NULL);
-    printf("output> %g s\n", CAL_TIME);
+    //gettimeofday(&temp_time, NULL);
+    //printf("output> %g s\n", CAL_TIME);
 
 	return 0;
 }
@@ -164,24 +169,24 @@ void block_FW()
     dim3 blocks_p2(Rounds, 2);
     dim3 blocks_p3(Rounds, Rounds);
     dim3 threads(B, B);
-    int pitch_int = pitch / sizeof(int);
 
 	for (int r = 0; r < Rounds; ++r) {
         int bstart = r * B;
         int block_round = MIN(n-bstart, B);
+        int pivot = bstart * pitch_int + bstart;
 
         //printf("%d %d\n", r, round);
 		// Phase 1
-        cal_phase1<<<1, threads>>>(Dist_d, pitch_int, block_round, bstart);
+        cal_phase1<<<1, threads>>>(block_round, pivot);
 
 		// Phase 2
-        cal_phase2<<<blocks_p2, threads>>>(Dist_d, pitch_int, Rounds, block_round, r);
+        cal_phase2<<<blocks_p2, threads>>>(block_round, r);
 
         // Phase 3
-        cal_phase3<<<blocks_p3, threads>>>(Dist_d, pitch_int, Rounds, block_round, r);
+        cal_phase3<<<blocks_p3, threads>>>(block_round, r);
 	}
 
-    set_inf<<<blocks_p3, threads>>>(Dist_d, pitch_int);
+    set_inf<<<blocks_p3, threads>>>();
     //print();
 }
 
@@ -214,16 +219,20 @@ void input(char *inFileName)
     dist_size_bytes = dist_size * sizeof(int);
     n_bytes = n * sizeof(int);
 
-    cudaMallocPitch((void **) &Dist_d, &pitch, b_rounds_bytes, b_rounds);
-    cudaMallocHost((void **) &Dist_h, dist_size_bytes);
+    cudaMallocPitch(&Dist_d, &pitch_d, b_rounds_bytes, b_rounds);
+
+    pitch_int = pitch_d / sizeof(int);
+    cudaMemcpyToSymbol(Dist, &Dist_d, sizeof(Dist_d), 0);
+    cudaMemcpyToSymbol(pitch, &pitch_int, sizeof(pitch_int), 0);
+    cudaMallocHost(&Dist_h, dist_size_bytes);
     memset(Dist_h, 64, dist_size_bytes);
 
 	for (int i = 0; i < dist_size; i+=b_rounds+1) {
         Dist_h[i] = 0;
 	}
 
-    gettimeofday(&temp_time, NULL);
-    printf("\tbefore> %g s\n", CAL_TIME);
+    //gettimeofday(&temp_time, NULL);
+    //printf("\tbefore> %g s\n", CAL_TIME);
 	while (--m >= 0) {
 		int a, b, v;
         tok = strtok_r(NULL, " ", &next_tok);
@@ -234,10 +243,10 @@ void input(char *inFileName)
         v = atoi(tok);
 		Dist_h[ b_rounds * a + b ] = v;
 	}
-    gettimeofday(&temp_time, NULL);
-    printf("\tafter> %g s\n", CAL_TIME);
+    //gettimeofday(&temp_time, NULL);
+    //printf("\tafter> %g s\n", CAL_TIME);
 
-    cudaMemcpy2D(Dist_d, pitch, Dist_h, b_rounds_bytes, b_rounds_bytes, b_rounds, cudaMemcpyHostToDevice);
+    cudaMemcpy2D(Dist_d, pitch_d, Dist_h, b_rounds_bytes, b_rounds_bytes, b_rounds, cudaMemcpyHostToDevice);
 
     if(sz>=INF)
         free(fstr);
@@ -247,20 +256,20 @@ void input(char *inFileName)
 
 void output(char *outFileName)
 {
-    cudaMemcpy2D(Dist_h, n_bytes, Dist_d, pitch, n_bytes, n, cudaMemcpyDeviceToHost);
+    cudaMemcpy2D(Dist_h, n_bytes, Dist_d, pitch_d, n_bytes, n, cudaMemcpyDeviceToHost);
     cudaFree(Dist_d);
     //print();
 
-    gettimeofday(&temp_time, NULL);
-    printf("\tbefore> %g s\n", CAL_TIME);
+    //gettimeofday(&temp_time, NULL);
+    //printf("\tbefore> %g s\n", CAL_TIME);
 
 	FILE *outfile = fopen(outFileName, "w");
     fwrite(Dist_h, sizeof(int), n*n, outfile);
 
     cudaFreeHost(Dist_h);
 
-    gettimeofday(&temp_time, NULL);
-    printf("\tafter> %g s\n", CAL_TIME);
+    //gettimeofday(&temp_time, NULL);
+    //printf("\tafter> %g s\n", CAL_TIME);
 
     fclose(outfile);
 }
