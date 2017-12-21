@@ -3,3 +3,6 @@ submit
 *.csv
 *.out
 *.txt
+*.prof
+HW4_*
+!*.cu
