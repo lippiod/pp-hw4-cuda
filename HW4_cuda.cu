@@ -3,28 +3,29 @@
 #include <string.h>
 #include <assert.h>
 #include <cuda.h>
+#include <unistd.h>
 #include <sys/time.h>
 
 #define CEIL(a, b) ( ((a) + (b) - 1) / (b) )
 #define MIN(a, b) ( (a) < (b) ? (a) : (b) )
 #define CAL_TIME ( 1e-6 * (temp_time.tv_usec - start_time.tv_usec) + (temp_time.tv_sec - start_time.tv_sec) )
+#define C2I(i) ( fstrp[i] - '0')
 
 #define INF 1000000000
-#define V   20500
 
 void input(char *inFileName);
 void output(char *outFileName);
 void block_FW();
 void print();
+void split_strings(int m, char *sstart);
 
-int n, n_bytes;	// Number of vertices, edges
-int B;
+int n, n_bytes; // Number of vertices, edges
 int Rounds, b_rounds, b_rounds_bytes, dist_size, dist_size_bytes;
 unsigned int *Dist_h;
 char buf[INF];
 char *fstr;
 
-//struct timeval start_time, temp_time;
+struct timeval start_time, temp_time;
 
 unsigned int *Dist_d;
 size_t pitch_d, pitch_int;
@@ -32,11 +33,13 @@ __constant__ unsigned int *Dist;
 __constant__ size_t pitch;
 
 //const int tpb = 1024;
-const int maxBF = 40;
+const int block_size = 32;
 
-__global__ void cal_phase1(int round, int pivot)
+cudaStream_t stream[16];
+
+__global__ void cal_phase1(int pivot)
 {
-    __shared__ unsigned int block_dist[maxBF][maxBF];
+    __shared__ unsigned int block_dist[block_size][block_size];
 
     int tidx = threadIdx.x, tidy = threadIdx.y;
     int block_index = pivot + pitch * tidy + tidx;
@@ -44,7 +47,7 @@ __global__ void cal_phase1(int round, int pivot)
     block_dist[tidy][tidx] = Dist[block_index];
     __syncthreads();
 
-    for(int k=0; k<round; k++) {
+    for(int k=0; k<block_size; k++) {
         unsigned int new_dist = block_dist[tidy][k] + block_dist[k][tidx];
         if (block_dist[tidy][tidx] > new_dist)
             block_dist[tidy][tidx] = new_dist;
@@ -54,38 +57,29 @@ __global__ void cal_phase1(int round, int pivot)
     Dist[block_index] = block_dist[tidy][tidx];
 }
 
-__global__ void cal_phase2(int round, int r)
+__global__ void cal_phase2_row(int r)
 {
-    __shared__ unsigned int block_dist[maxBF][maxBF];
-    __shared__ unsigned int pivot_dist[maxBF][maxBF];
+    __shared__ unsigned int block_dist[block_size][block_size];
+    __shared__ unsigned int pivot_dist[block_size][block_size];
 
     int tidx = threadIdx.x, tidy = threadIdx.y;
-    int pivot = blockDim.x * r;
+    int pivot = block_size * r;
     int py = pitch * (pivot + tidy);
     int px = pivot + tidx;
     int block_index, pivot_index;
-    unsigned int (*D1)[maxBF], (*D2)[maxBF];
 
     if(blockIdx.x==r) // pivot block
         return;
 
+    block_index = py + block_size * blockIdx.x + tidx;
     pivot_index = py + px;
-    pivot_dist[tidy][tidx] = Dist[pivot_index];
 
-    if(blockIdx.y==0) { // row pivot
-        block_index = py + blockDim.x * blockIdx.x + tidx;
-        D1 = pivot_dist;
-        D2 = block_dist;
-    } else { // column pivot
-        block_index = pitch * (blockDim.x * blockIdx.x + tidy) + px;
-        D1 = block_dist;
-        D2 = pivot_dist;
-    }
     block_dist[tidy][tidx] = Dist[block_index];
+    pivot_dist[tidy][tidx] = Dist[pivot_index];
     __syncthreads();
 
-    for(int k=0; k<round; k++) {
-        unsigned int new_dist = D1[tidy][k] + D2[k][tidx];
+    for(int k=0; k<block_size; k++) {
+        unsigned int new_dist = pivot_dist[tidy][k] + block_dist[k][tidx];
 
         if (block_dist[tidy][tidx] > new_dist)
             block_dist[tidy][tidx] = new_dist;
@@ -95,16 +89,48 @@ __global__ void cal_phase2(int round, int r)
     Dist[block_index] = block_dist[tidy][tidx];
 }
 
-__global__ void cal_phase3(int round, int r)
+__global__ void cal_phase2_col(int r)
 {
-    __shared__ unsigned int block_dist[maxBF][maxBF];
-    __shared__ unsigned int pvRow_dist[maxBF][maxBF];
-    __shared__ unsigned int pvCol_dist[maxBF][maxBF];
+    __shared__ unsigned int block_dist[block_size][block_size];
+    __shared__ unsigned int pivot_dist[block_size][block_size];
 
     int tidx = threadIdx.x, tidy = threadIdx.y;
-    int bx = blockDim.x * blockIdx.x, by = blockDim.y * blockIdx.y;
-    int pv = blockDim.x * r;
+    int pivot = block_size * r;
+    int py = pitch * (pivot + tidy);
+    int px = pivot + tidx;
+    int block_index, pivot_index;
+
+    if(blockIdx.x==r) // pivot block
+        return;
+
+    block_index = pitch * (block_size * blockIdx.x + tidy) + px;
+    pivot_index = py + px;
+
+    block_dist[tidy][tidx] = Dist[block_index];
+    pivot_dist[tidy][tidx] = Dist[pivot_index];
+    __syncthreads();
+
+    for(int k=0; k<block_size; k++) {
+        unsigned int new_dist = block_dist[tidy][k] + pivot_dist[k][tidx];
+
+        if (block_dist[tidy][tidx] > new_dist)
+            block_dist[tidy][tidx] = new_dist;
+        __syncthreads();
+    }
+
+    Dist[block_index] = block_dist[tidy][tidx];
+}
+
+__global__ void cal_phase3(int r)
+{
+    __shared__ unsigned int pvRow_dist[block_size][block_size];
+    __shared__ unsigned int pvCol_dist[block_size][block_size];
+
+    int tidx = threadIdx.x, tidy = threadIdx.y;
+    int bx = block_size * blockIdx.x, by = block_size * blockIdx.y;
+    int pv = block_size * r;
     int block_index, pvRow_index, pvCol_index;
+    unsigned int block_dist;
 
     if(blockIdx.y==r || blockIdx.x==r) // pivots
         return;
@@ -117,20 +143,20 @@ __global__ void cal_phase3(int round, int r)
     __syncthreads();
 
     block_index = pitch * (by + tidy) + bx + tidx;
-    block_dist[tidy][tidx] = Dist[block_index];
+    block_dist = Dist[block_index];
 
-    for(int k=0; k<round; k++) {
+    for(int k=0; k<block_size; k++) {
         unsigned int new_dist = pvCol_dist[tidy][k] + pvRow_dist[k][tidx];
-        if (block_dist[tidy][tidx] > new_dist)
-            block_dist[tidy][tidx] = new_dist;
+        if (block_dist > new_dist)
+            block_dist = new_dist;
     }
 
-    Dist[block_index] = block_dist[tidy][tidx];
+    Dist[block_index] = block_dist;
 }
 
 __global__ void set_inf()
 {
-    int dist_index = pitch * (blockDim.y * blockIdx.y + threadIdx.y) + blockDim.x * blockIdx.x + threadIdx.x;
+    int dist_index = pitch * (block_size * blockIdx.y + threadIdx.y) + block_size * blockIdx.x + threadIdx.x;
     unsigned int value = Dist[ dist_index ];
 
     if (value>=INF)
@@ -142,57 +168,60 @@ __global__ void set_inf()
 int main(int argc, char* argv[])
 {
     assert(argc==4);
-	B = atoi(argv[3]);
+    //B = atoi(argv[3]);
 
-    //gettimeofday(&start_time, NULL);
+    //cudaStreamCreate(&stream[0]);
 
-	input(argv[1]);
-    //gettimeofday(&temp_time, NULL);
-    //printf("input> %g s\n", CAL_TIME);
+    gettimeofday(&start_time, NULL);
 
-    //print();
-	block_FW();
-    //gettimeofday(&temp_time, NULL);
-    //printf("block_FW> %g s\n", CAL_TIME);
+    input(argv[1]);
+    gettimeofday(&temp_time, NULL);
+    printf("input> %g s\n", CAL_TIME);
 
     //print();
-	output(argv[2]);
-    //gettimeofday(&temp_time, NULL);
-    //printf("output> %g s\n", CAL_TIME);
+    block_FW();
+    gettimeofday(&temp_time, NULL);
+    printf("block_FW> %g s\n", CAL_TIME);
 
-	return 0;
+    //print();
+    output(argv[2]);
+    gettimeofday(&temp_time, NULL);
+    printf("output> %g s\n", CAL_TIME);
+
+    //cudaStreamDestroy(stream[0]);
+
+    return 0;
 }
 
 
 void block_FW()
 {
-    dim3 blocks_p2(Rounds, 2);
     dim3 blocks_p3(Rounds, Rounds);
-    dim3 threads(B, B);
+    dim3 threads(block_size, block_size);
 
-	for (int r = 0; r < Rounds; ++r) {
-        int bstart = r * B;
-        int block_round = MIN(n-bstart, B);
+    for (int r = 0; r < Rounds; ++r) {
+        int bstart = r * block_size;
+        //int block_round = MIN(n-bstart, B);
         int pivot = bstart * pitch_int + bstart;
 
-        //printf("%d %d\n", r, round);
-		// Phase 1
-        cal_phase1<<<1, threads>>>(block_round, pivot);
+        // Phase 1
+        cal_phase1<<<1, threads>>>(pivot);
 
-		// Phase 2
-        cal_phase2<<<blocks_p2, threads>>>(block_round, r);
+        // Phase 2
+        cal_phase2_row<<<Rounds, threads>>>(r);
+        cal_phase2_col<<<Rounds, threads>>>(r);
 
         // Phase 3
-        cal_phase3<<<blocks_p3, threads>>>(block_round, r);
-	}
+        cal_phase3<<<blocks_p3, threads>>>(r);
 
+    }
     set_inf<<<blocks_p3, threads>>>();
-    //print();
+    cudaMemcpy2DAsync(Dist_h, n_bytes, Dist_d, pitch_d, n_bytes, n, cudaMemcpyDeviceToHost);
 }
 
 void input(char *inFileName)
 {
-	FILE *infile = fopen(inFileName, "rb");
+    FILE *infile = fopen(inFileName, "rb");
     fseek(infile, 0L, SEEK_END);
     size_t sz = ftell(infile);
     fseek(infile, 0L, SEEK_SET);
@@ -204,7 +233,7 @@ void input(char *inFileName)
 
     size_t fsize = fread(fstr, sizeof(char), sz+10, infile);
     char *tok, *next_tok;
-    int m;
+    size_t m;
 
     fstr[fsize] = '\0';
     tok = strtok_r(fstr, " ", &next_tok);
@@ -212,41 +241,32 @@ void input(char *inFileName)
     tok = strtok_r(NULL, "\n", &next_tok);
     m = atoi(tok);
 
-    Rounds = CEIL(n, B);
-    b_rounds = B * Rounds;
+    Rounds = CEIL(n, block_size);
+    b_rounds = block_size * Rounds;
     b_rounds_bytes = b_rounds * sizeof(int);
     dist_size = b_rounds * b_rounds;
     dist_size_bytes = dist_size * sizeof(int);
     n_bytes = n * sizeof(int);
 
     cudaMallocPitch(&Dist_d, &pitch_d, b_rounds_bytes, b_rounds);
-
     pitch_int = pitch_d / sizeof(int);
-    cudaMemcpyToSymbol(Dist, &Dist_d, sizeof(Dist_d), 0);
-    cudaMemcpyToSymbol(pitch, &pitch_int, sizeof(pitch_int), 0);
+    cudaMemcpyToSymbolAsync(Dist, &Dist_d, sizeof(Dist_d), 0);
+    cudaMemcpyToSymbolAsync(pitch, &pitch_int, sizeof(pitch_int), 0);
     cudaMallocHost(&Dist_h, dist_size_bytes);
     memset(Dist_h, 64, dist_size_bytes);
 
-	for (int i = 0; i < dist_size; i+=b_rounds+1) {
+    for (int i = 0; i < dist_size; i+=b_rounds+1) {
         Dist_h[i] = 0;
-	}
+    }
+    gettimeofday(&temp_time, NULL);
+    printf("\tbefore> %g s\n", CAL_TIME);
 
-    //gettimeofday(&temp_time, NULL);
-    //printf("\tbefore> %g s\n", CAL_TIME);
-	while (--m >= 0) {
-		int a, b, v;
-        tok = strtok_r(NULL, " ", &next_tok);
-        a = atoi(tok);
-        tok = strtok_r(NULL, " ", &next_tok);
-        b = atoi(tok);
-        tok = strtok_r(NULL, "\n", &next_tok);
-        v = atoi(tok);
-		Dist_h[ b_rounds * a + b ] = v;
-	}
-    //gettimeofday(&temp_time, NULL);
-    //printf("\tafter> %g s\n", CAL_TIME);
+    split_strings(m, next_tok);
 
-    cudaMemcpy2D(Dist_d, pitch_d, Dist_h, b_rounds_bytes, b_rounds_bytes, b_rounds, cudaMemcpyHostToDevice);
+    gettimeofday(&temp_time, NULL);
+    printf("\tafter> %g s\n", CAL_TIME);
+
+    cudaMemcpy2DAsync(Dist_d, pitch_d, Dist_h, b_rounds_bytes, b_rounds_bytes, b_rounds, cudaMemcpyHostToDevice);
 
     if(sz>=INF)
         free(fstr);
@@ -256,20 +276,14 @@ void input(char *inFileName)
 
 void output(char *outFileName)
 {
-    cudaMemcpy2D(Dist_h, n_bytes, Dist_d, pitch_d, n_bytes, n, cudaMemcpyDeviceToHost);
-    cudaFree(Dist_d);
-    //print();
+    FILE *outfile = fopen(outFileName, "w");
+    ftruncate(fileno(outfile), n*n);
 
-    //gettimeofday(&temp_time, NULL);
-    //printf("\tbefore> %g s\n", CAL_TIME);
-
-	FILE *outfile = fopen(outFileName, "w");
+    cudaDeviceSynchronize();
     fwrite(Dist_h, sizeof(int), n*n, outfile);
 
+    cudaFree(Dist_d);
     cudaFreeHost(Dist_h);
-
-    //gettimeofday(&temp_time, NULL);
-    //printf("\tafter> %g s\n", CAL_TIME);
 
     fclose(outfile);
 }
@@ -287,4 +301,57 @@ void print()
         printf("\n");
     }
     printf("\n");
+}
+
+void split_strings(int m, char *fstrp)
+{
+    int a, b, v;
+    while(m-->0) {
+
+        if(fstrp[1]==' ') {
+            a = C2I(0);
+            fstrp += 2;
+        } else if(fstrp[2]==' ') {
+            a = C2I(0) * 10 + C2I(1);
+            fstrp += 3;
+        } else if(fstrp[3]==' ') {
+            a = C2I(0) * 100 + C2I(1) * 10 + C2I(2);
+            fstrp += 4;
+        } else if(fstrp[4]==' ') {
+            a = C2I(0) * 1000 + C2I(1) * 100 + C2I(2) * 10 + C2I(3);
+            fstrp += 5;
+        } else {
+            a = C2I(0) * 10000 + C2I(1) * 1000 + C2I(2) * 100 + C2I(3) * 10 + C2I(4);
+            fstrp += 6;
+        }
+
+        if(fstrp[1]==' ') {
+            b = C2I(0);
+            fstrp += 2;
+        } else if(fstrp[2]==' ') {
+            b = C2I(0) * 10 + C2I(1);
+            fstrp += 3;
+        } else if(fstrp[3]==' ') {
+            b = C2I(0) * 100 + C2I(1) * 10 + C2I(2);
+            fstrp += 4;
+        } else if(fstrp[4]==' ') {
+            b = C2I(0) * 1000 + C2I(1) * 100 + C2I(2) * 10 + C2I(3);
+            fstrp += 5;
+        } else {
+            b = C2I(0) * 10000 + C2I(1) * 1000 + C2I(2) * 100 + C2I(3) * 10 + C2I(4);
+            fstrp += 6;
+        }
+
+        if(fstrp[1]=='\n') {
+            v = C2I(0);
+            fstrp += 2;
+        } else if(fstrp[2]=='\n') {
+            v = C2I(0) * 10 + C2I(1);
+            fstrp += 3;
+        } else {
+            v = C2I(0) * 100 + C2I(1) * 10 + C2I(2);
+            fstrp += 4;
+        }
+        Dist_h[ b_rounds * a + b ] = v;
+    }
 }

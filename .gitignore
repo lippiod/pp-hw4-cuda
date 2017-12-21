@@ -4,5 +4,7 @@ submit
 *.out
 *.txt
 *.prof
+*.log
+*.time
 HW4_*
 !*.cu
