@@ -48,8 +48,9 @@ size_t line_d = block_size * pitch;
 size_t line_n = block_size * n;
 
 cudaStream_t stream[max_streams], stream_s;
-cudaEvent_t ev_before, ev_2;
+cudaEvent_t ev_before, ev_1, ev_2;
 
+int id[V];
 
 __global__ void cal_phase1(int pivot)
 {
@@ -115,44 +116,12 @@ __global__ void cal_phase2_blk(int p1_pivot, int p2_pivot)
 
     pivot_dist[ty][tx] = Dist[p1_pivot + tid];
 
-    block_index = p2_pivot + tid;
+    block_index = p2_pivot + tid + blockIdx.x * pitch_d * block_size;
     block_dist[ty][tx] = Dist[block_index];
     __syncthreads();
 
     for(int k=0; k<block_size; k++) {
         unsigned int new_dist = block_dist[ty][k] + pivot_dist[k][tx];
-
-        if (block_dist[ty][tx] > new_dist)
-            block_dist[ty][tx] = new_dist;
-        __syncthreads();
-    }
-
-    Dist[block_index] = block_dist[ty][tx];
-}
-
-__global__ void cal_phase2_col(int pivot, int r)
-{
-    __shared__ unsigned int block_dist[block_size][block_size];
-    __shared__ unsigned int pivot_dist[block_size][block_size];
-
-    int tx = threadIdx.x, ty = threadIdx.y;
-    int tid = ty * pitch_d + tx;
-    int block_index, pivot_index;
-    int row_diff = pitch_d * block_size * (blockIdx.x - r);
-
-    pivot_index = pivot + tid;
-
-    if(row_diff==0) // pivot
-        return;
-
-    pivot_dist[tx][ty] = Dist[pivot_index];
-
-    block_index = pivot_index + row_diff;
-    block_dist[ty][tx] = Dist[block_index];
-    __syncthreads();
-
-    for(int k=0; k<block_size; k++) {
-        unsigned int new_dist = block_dist[ty][k] + pivot_dist[tx][k];
 
         if (block_dist[ty][tx] > new_dist)
             block_dist[ty][tx] = new_dist;
@@ -193,32 +162,6 @@ __global__ void cal_phase3(int p1_pivot, int p2_pivot, int r)
     }
 
     Dist[block_index] = block_dist;
-}
-
-__global__ void cal_phase2_blk_2(int p1_pivot, int p2_pivot)
-{
-    __shared__ unsigned int block_dist[block_size][block_size];
-    __shared__ unsigned int pivot_dist[block_size][block_size];
-
-    int tx = threadIdx.x, ty = threadIdx.y;
-    int tid = ty * pitch_d + tx;
-    int block_index;
-
-    pivot_dist[ty][tx] = Dist[p1_pivot + tid];
-
-    block_index = p2_pivot + tid + blockIdx.x * pitch_d * block_size;
-    block_dist[ty][tx] = Dist[block_index];
-    __syncthreads();
-
-    for(int k=0; k<block_size; k++) {
-        unsigned int new_dist = block_dist[ty][k] + pivot_dist[k][tx];
-
-        if (block_dist[ty][tx] > new_dist)
-            block_dist[ty][tx] = new_dist;
-        __syncthreads();
-    }
-
-    Dist[block_index] = block_dist[ty][tx];
 }
 
 __global__ void cal_phase3_2(int p1_pivot, int p2_pivot, int p3_pivot, int r)
@@ -330,12 +273,14 @@ void block_FW()
     int p1_start = 0, p2_start = 0;
     unsigned int *ptr_h = Dist_h, *ptr_d = Dist_d;
     int p2_sub;
-    int s = 0;
+    int s;
     int flag;
 
+    id[0] = 0;
     cudaEventRecord(ev_2, stream[0]);
     //printf("round 1\n");
     for(int i=1; i<first_round; i++) {
+        id[i] = i / 2;
         ptr_h += line_h;
         ptr_d += line_d;
         cudaStreamCreate(&stream[i]);
@@ -367,6 +312,8 @@ void block_FW()
     }
 
     for(int i=first_round; i<Rounds; i++) {
+        id[i] = (i / 2) % max_streams;
+        s = id[i];
 
         ptr_h += line_h;
         ptr_d += line_d;
@@ -390,11 +337,14 @@ void block_FW()
             cudaEventRecord(ev_before, stream[s]);
             cudaStreamWaitEvent(stream_s, ev_before, 0);
         }
-
-        s = s+1<max_streams ? s+1 : 0;
+    }
+    cudaEventCreate(&ev_1);
+    for(int i=1; i<Rounds; i+=2) {
+        cudaEventRecord(ev_1, stream[id[i]]);
+        cudaStreamWaitEvent(stream[id[i-1]], ev_1, 0);
     }
 
-    s = 0;
+
     //printf("R %d\n", Rounds);
     for (int r=first_round; r<Rounds; ++r) {
 
@@ -415,52 +365,50 @@ void block_FW()
         //printf("r %d\n", r);
         flag = 1;
         for(int i = (r+1) % Rounds; i != r; i = (i==Rounds-1) ? 0 : i+1) {
+            s = id[i];
             p2_start = p1_start + line_d * (i-r);
 /*
             cal_phase2_blk<<< 1, threads, 0, stream[s]>>>(p1_start, p2_start);
             cal_phase3<<<Rounds, threads, 0, stream[s]>>>(p1_start, p2_start, r);
 */
-            if(flag) {
-                if(i==Rounds-1 || i==r-1) {
+            if(flag>0) {
+                if(i==Rounds-1 || i==r-1 || i%2==1) {
                     //printf("\ti %d\n", i);
                     cal_phase2_blk<<< 1, threads, 0, stream[s]>>>(p1_start, p2_start);
                     cal_phase3<<<Rounds, threads, 0, stream[s]>>>(p1_start, p2_start, r);
                 } else {
 
                     //printf("\ti %d %d\n", i, (i+1)%Rounds);
-                    cal_phase2_blk_2<<< 2, threads, 0, stream[s]>>>(p1_start, p2_start);
+                    cal_phase2_blk<<< 2, threads, 0, stream[s]>>>(p1_start, p2_start);
                     cal_phase3_2<<<Rounds, threads, 0, stream[s]>>>(p1_start, p2_start, p2_start + line_d, r);
-                    flag = 0;
+                    flag--;
 /*
                     cal_phase2_blk_2<<< 2, threads, 0, stream[s]>>>(p1_start, p2_start);
                     cal_phase3<<<Rounds, threads, 0, stream[s]>>>(p1_start, p2_start, r);
                     cal_phase3<<<Rounds, threads, 0, stream[s]>>>(p1_start, p2_start+line_d, r);
 */
-                    flag = 0;
+                }
+
+                if(r==Rounds-1) {
+                    ptr_d = Dist_d + i * line_d;
+                    set_inf_row<<<Rounds, threads, 0, stream[s]>>>(ptr_d);
+                    ptr_h = Dist_h + i * line_n;
+                    cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, block_size, cudaMemcpyDeviceToHost, stream[s]);
+                    if(flag<=0) {
+                        ptr_d += line_d;
+                        set_inf_row<<<Rounds, threads, 0, stream[s]>>>(ptr_d);
+                        ptr_h += line_n;
+                        cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, block_size, cudaMemcpyDeviceToHost, stream[s]);
+                    }
                 }
             } else {
-                flag = 1;
+                flag++;
             }
 
             if(i==r+1) {
                 cudaEventRecord(ev_before, stream[s]);
                 cudaStreamWaitEvent(stream_s, ev_before, 0);
             }
-
-            if(r==Rounds-1) {
-                ptr_d = Dist_d + i * line_d;
-                set_inf_row<<<Rounds, threads, 0, stream[s]>>>(ptr_d);
-                ptr_h = Dist_h + i * line_n;
-                cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, block_size, cudaMemcpyDeviceToHost, stream[s]);
-                if(!flag) {
-                    ptr_d += line_d;
-                    set_inf_row<<<Rounds, threads, 0, stream[s]>>>(ptr_d);
-                    ptr_h += line_n;
-                    cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, block_size, cudaMemcpyDeviceToHost, stream[s]);
-                }
-            }
-            if(flag)
-                s = s+1<max_streams ? s+1 : 0;
         }
         p1_start += diag_size;
     }
@@ -531,6 +479,7 @@ void output(char *outFileName)
     }
     cudaStreamDestroy(stream_s);
     cudaEventDestroy(ev_before);
+    cudaEventDestroy(ev_1);
     cudaEventDestroy(ev_2);
 
     cudaDeviceSynchronize();
@@ -658,4 +607,5 @@ void block_FW_S()
         ptr_d += line_d;
     }
     cudaStreamCreate(&stream_s);
+    cudaEventCreate(&ev_1);
 }
