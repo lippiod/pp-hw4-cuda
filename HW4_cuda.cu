@@ -17,7 +17,7 @@
 
 void input(char *inFileName);
 void output(char *outFileName);
-void block_FW();
+void block_FW(char *outfile);
 void block_FW_S();
 void print();
 void split_strings(int m, char *sstart);
@@ -39,16 +39,18 @@ __constant__ int pitch_d;
 
 //const int tpb = 1024;
 const int block_size = 32;
-const int max_streams = 4;
-const int first_round = 4;
+const int file_step = 10;
+const int write_size = 6;
+int max_streams = 4;
+int first_round = 4;
 
 dim3 threads(block_size, block_size);
 size_t line_h = block_size * b_rounds;
 size_t line_d = block_size * pitch;
 size_t line_n = block_size * n;
 
-cudaStream_t stream[max_streams], stream_s;
-cudaEvent_t ev_before, ev_1, ev_2;
+cudaStream_t stream[8], stream_s, stream_m;
+cudaEvent_t ev_1, ev_2;
 
 int id[V];
 
@@ -164,7 +166,7 @@ __global__ void cal_phase3(int p1_pivot, int p2_pivot, int r)
     Dist[block_index] = block_dist;
 }
 
-__global__ void cal_phase3_2(int p1_pivot, int p2_pivot, int p3_pivot, int r)
+__global__ void cal_phase3_2(int p1_pivot, int p2_pivot, int r)
 {
     __shared__ unsigned int pvR1_dist[block_size][block_size];
     __shared__ unsigned int pvC1_dist[block_size][block_size];
@@ -177,27 +179,27 @@ __global__ void cal_phase3_2(int p1_pivot, int p2_pivot, int p3_pivot, int r)
     unsigned int b1_dist, b2_dist, inter[block_size];
 
     p1_index = p1_pivot + tid + col_diff;
-    p2_index = p2_pivot + tid;
-    p3_index = p3_pivot + tid;
 
     if(col_diff==0) // pivots
         return;
 
     pvR1_dist[ty][tx] = Dist[p1_index];
+    p2_index = p2_pivot + tid;
     pvC1_dist[ty][tx] = Dist[p2_index];
+    p3_index = p2_index + pitch_d * block_size;
     pvC2_dist[ty][tx] = Dist[p3_index];
     __syncthreads();
 
     b1_index = p2_index + col_diff;
-    b2_index = p3_index + col_diff;
     b1_dist = Dist[b1_index];
+    b2_index = p3_index + col_diff;
     b2_dist = Dist[b2_index];
 
     for(int k=0; k<block_size; k++) {
         inter[k] = pvR1_dist[k][tx];
-        unsigned int new_dist = pvC1_dist[ty][k] + inter[k];
-        if (b1_dist > new_dist)
-            b1_dist = new_dist;
+        unsigned int new_dist1 = pvC1_dist[ty][k] + inter[k];
+        if (b1_dist > new_dist1)
+            b1_dist = new_dist1;
     }
     Dist[b1_index] = b1_dist;
 
@@ -206,6 +208,7 @@ __global__ void cal_phase3_2(int p1_pivot, int p2_pivot, int p3_pivot, int r)
         if (b2_dist > new_dist)
             b2_dist = new_dist;
     }
+
     Dist[b2_index] = b2_dist;
 }
 
@@ -233,17 +236,15 @@ int main(int argc, char* argv[])
 
     cuda_init();
 
-    if(Rounds<=first_round)
+    if(Rounds<=first_round) {
         block_FW_S();
-    else
-        block_FW();
+        output(argv[2]);
+    } else {
+        block_FW(argv[2]);
+    }
 
     gettimeofday(&temp_time, NULL);
     printf("block_FW> %g s\n", CAL_TIME);
-
-    output(argv[2]);
-    gettimeofday(&temp_time, NULL);
-    printf("output> %g s\n", CAL_TIME);
 
     return 0;
 }
@@ -251,6 +252,7 @@ int main(int argc, char* argv[])
 
 void cuda_init()
 {
+    cudaStreamCreate(&stream_m);
     cudaMemcpy2DAsync(Dist_d, pitch_bytes, Dist_h, b_rounds_bytes, b_rounds_bytes, block_size, cudaMemcpyHostToDevice);
 
     line_h = block_size * b_rounds;
@@ -258,33 +260,37 @@ void cuda_init()
     line_n = block_size * n;
     diag_size = (pitch + 1) * block_size;
 
-    //cudaStreamCreate(&stream_s1);
     cudaStreamCreate(&stream[0]);
     cal_phase1<<<1, threads, 0, stream[0]>>>(0);
     cal_phase2_row<<<Rounds, threads, 0, stream[0]>>>(0, 0);
 
-    cudaEventCreate(&ev_before);
-    cudaEventCreate(&ev_2);
-
+    cudaEventCreateWithFlags(&ev_1, cudaEventDisableTiming);
 }
 
-void block_FW()
+void block_FW(char *outfile)
 {
     int p1_start = 0, p2_start = 0;
-    unsigned int *ptr_h = Dist_h, *ptr_d = Dist_d;
+    unsigned int *ptr_f = Dist_h, *ptr_h = Dist_h, *ptr_d = Dist_d;
     int p2_sub;
-    int s;
+    int s = 0, cnt = 0;
     int flag;
+    FILE *fp = fopen(outfile, "w");
+    int step_size = 0;
+    int total = n * n;
 
     id[0] = 0;
-    cudaEventRecord(ev_2, stream[0]);
+    cudaEventRecord(ev_1, stream[0]);
     //printf("round 1\n");
     for(int i=1; i<first_round; i++) {
         id[i] = i / 2;
         ptr_h += line_h;
         ptr_d += line_d;
+        cudaMemcpy2DAsync(ptr_d, pitch_bytes, ptr_h, b_rounds_bytes, b_rounds_bytes, block_size, cudaMemcpyHostToDevice, stream_m);
+        cudaEventCreateWithFlags(&ev_2, cudaEventDisableTiming);
+        cudaEventRecord(ev_2, stream_m);
+
         cudaStreamCreate(&stream[i]);
-        cudaMemcpy2DAsync(ptr_d, pitch_bytes, ptr_h, b_rounds_bytes, b_rounds_bytes, block_size, cudaMemcpyHostToDevice, stream[i]);
+        cudaStreamWaitEvent(stream[i], ev_1, 0);
         cudaStreamWaitEvent(stream[i], ev_2, 0);
 
         p2_start += line_d;
@@ -298,11 +304,11 @@ void block_FW()
         cal_phase1<<<1, threads, 0, stream[i]>>>(p1_start);
         cal_phase2_row<<<Rounds, threads, 0, stream[i]>>>(p1_start, i);
 
-        cudaEventRecord(ev_2, stream[i]);
+        cudaEventRecord(ev_1, stream[i]);
         for(int j=0; j<first_round; j++) {
             if(i==j) continue;
 
-            cudaStreamWaitEvent(stream[j], ev_2, 0);
+            cudaStreamWaitEvent(stream[j], ev_1, 0);
 
             p2_sub = p1_start + line_d * (j - i);
             //printf("\tp1=(%d,%d), p2=(%d,%d) stream %d\n", ROW_COL(p1_start), ROW_COL(p2_sub), j);
@@ -317,7 +323,9 @@ void block_FW()
 
         ptr_h += line_h;
         ptr_d += line_d;
-        cudaMemcpy2DAsync(ptr_d, pitch_bytes, ptr_h, b_rounds_bytes, b_rounds_bytes, block_size, cudaMemcpyHostToDevice, stream[s]);
+        cudaMemcpy2DAsync(ptr_d, pitch_bytes, ptr_h, b_rounds_bytes, b_rounds_bytes, block_size, cudaMemcpyHostToDevice, stream_m);
+        cudaEventRecord(ev_2, stream_m);
+        cudaStreamWaitEvent(stream[s], ev_2, 0);
 
         p2_start += line_d;
 
@@ -334,11 +342,10 @@ void block_FW()
         }
         if(i==first_round) {
             cudaStreamCreate(&stream_s);
-            cudaEventRecord(ev_before, stream[s]);
-            cudaStreamWaitEvent(stream_s, ev_before, 0);
+            cudaEventRecord(ev_1, stream[s]);
+            cudaStreamWaitEvent(stream_s, ev_1, 0);
         }
     }
-    cudaEventCreate(&ev_1);
     for(int i=1; i<Rounds; i+=2) {
         cudaEventRecord(ev_1, stream[id[i]]);
         cudaStreamWaitEvent(stream[id[i-1]], ev_1, 0);
@@ -349,17 +356,17 @@ void block_FW()
     for (int r=first_round; r<Rounds; ++r) {
 
         cal_phase1<<<1, threads, 0, stream_s>>>(p1_start);
-
         cal_phase2_row<<<Rounds, threads, 0, stream_s>>>(p1_start, r);
-        cudaEventRecord(ev_2, stream_s);
+        cudaEventRecord(ev_1, stream_s);
         for(int i=0; i<max_streams; i++)
-            cudaStreamWaitEvent(stream[i], ev_2, 0);
+            cudaStreamWaitEvent(stream[i], ev_1, 0);
 
         if(r==Rounds-1) {
             ptr_h = Dist_h + r * line_n;
             ptr_d = Dist_d + r * line_d;
-            set_inf_row<<<Rounds, threads, 0, stream_s>>>(ptr_d);
-            cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, block_size, cudaMemcpyDeviceToHost, stream_s);
+            cudaStreamWaitEvent(stream_m, ev_1, 0);
+            set_inf_row<<<Rounds, threads, 0, stream_m>>>(ptr_d);
+            cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, block_size, cudaMemcpyDeviceToHost, stream_m);
         }
 
         //printf("r %d\n", r);
@@ -367,10 +374,6 @@ void block_FW()
         for(int i = (r+1) % Rounds; i != r; i = (i==Rounds-1) ? 0 : i+1) {
             s = id[i];
             p2_start = p1_start + line_d * (i-r);
-/*
-            cal_phase2_blk<<< 1, threads, 0, stream[s]>>>(p1_start, p2_start);
-            cal_phase3<<<Rounds, threads, 0, stream[s]>>>(p1_start, p2_start, r);
-*/
             if(flag>0) {
                 if(i==Rounds-1 || i==r-1 || i%2==1) {
                     //printf("\ti %d\n", i);
@@ -380,25 +383,37 @@ void block_FW()
 
                     //printf("\ti %d %d\n", i, (i+1)%Rounds);
                     cal_phase2_blk<<< 2, threads, 0, stream[s]>>>(p1_start, p2_start);
-                    cal_phase3_2<<<Rounds, threads, 0, stream[s]>>>(p1_start, p2_start, p2_start + line_d, r);
+                    cal_phase3_2<<<Rounds, threads, 0, stream[s]>>>(p1_start, p2_start, r);
                     flag--;
-/*
-                    cal_phase2_blk_2<<< 2, threads, 0, stream[s]>>>(p1_start, p2_start);
-                    cal_phase3<<<Rounds, threads, 0, stream[s]>>>(p1_start, p2_start, r);
-                    cal_phase3<<<Rounds, threads, 0, stream[s]>>>(p1_start, p2_start+line_d, r);
-*/
                 }
 
                 if(r==Rounds-1) {
+                    cudaEventRecord(ev_1);
+                    cudaStreamWaitEvent(stream_m, ev_1, 0);
+
                     ptr_d = Dist_d + i * line_d;
-                    set_inf_row<<<Rounds, threads, 0, stream[s]>>>(ptr_d);
+                    set_inf_row<<<Rounds, threads, 0, stream_m>>>(ptr_d);
                     ptr_h = Dist_h + i * line_n;
-                    cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, block_size, cudaMemcpyDeviceToHost, stream[s]);
+                    cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, block_size, cudaMemcpyDeviceToHost, stream_m);
+                    cnt++;
                     if(flag<=0) {
                         ptr_d += line_d;
-                        set_inf_row<<<Rounds, threads, 0, stream[s]>>>(ptr_d);
+                        set_inf_row<<<Rounds, threads, 0, stream_m>>>(ptr_d);
                         ptr_h += line_n;
-                        cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, block_size, cudaMemcpyDeviceToHost, stream[s]);
+                        cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, block_size, cudaMemcpyDeviceToHost, stream_m);
+                        cnt++;
+                    }
+                    if(cnt>=file_step) {
+                        if(step_size>0) {
+                            //printf("%d\n", i);
+                            total -= step_size;
+                            cudaEventSynchronize(ev_2);
+                            fwrite(ptr_f, sizeof(int), step_size, fp);
+                            ptr_f += step_size;
+                        }
+                        step_size = write_size * line_n;
+                        cnt = 0;
+                        cudaEventRecord(ev_2, stream_m);
                     }
                 }
             } else {
@@ -406,12 +421,39 @@ void block_FW()
             }
 
             if(i==r+1) {
-                cudaEventRecord(ev_before, stream[s]);
-                cudaStreamWaitEvent(stream_s, ev_before, 0);
+                cudaEventRecord(ev_1, stream[s]);
+                cudaStreamWaitEvent(stream_s, ev_1, 0);
             }
         }
         p1_start += diag_size;
     }
+    //printf("cnt %d, sum %d, n %d\n", cnt, sum + cnt*block_size, n);
+    if(step_size>0) {
+        //printf("%d\n", i);
+        total -= step_size;
+        cudaEventSynchronize(ev_2);
+        fwrite(ptr_f, sizeof(int), step_size, fp);
+        ptr_f += step_size;
+    }
+
+    cudaEventRecord(ev_2, stream_m);
+    cudaEventSynchronize(ev_2);
+    fwrite(ptr_f, sizeof(int), total, fp);
+
+    for(int i=0; i<max_streams; i++) {
+        cudaStreamDestroy(stream[i]);
+    }
+    cudaStreamDestroy(stream_s);
+    cudaEventDestroy(ev_1);
+    cudaStreamDestroy(stream_m);
+    cudaEventDestroy(ev_2);
+
+    cudaFree(Dist_d);
+    cudaFreeHost(Dist_h);
+
+    fclose(fp);
+
+    cudaDeviceSynchronize();
 }
 
 void input(char *inFileName)
@@ -435,6 +477,11 @@ void input(char *inFileName)
     n = atoi(tok);
     tok = strtok_r(NULL, "\n", &next_tok);
     m = atoi(tok);
+
+    if(n>=10000) {
+        max_streams = 6;
+        first_round = 6;
+    }
 
     Rounds = CEIL(n, block_size);
     b_rounds = block_size * Rounds;
@@ -477,8 +524,6 @@ void output(char *outFileName)
     for(int i=0; i<max_streams; i++) {
         cudaStreamDestroy(stream[i]);
     }
-    cudaStreamDestroy(stream_s);
-    cudaEventDestroy(ev_before);
     cudaEventDestroy(ev_1);
     cudaEventDestroy(ev_2);
 
@@ -565,13 +610,17 @@ void block_FW_S()
     unsigned int *ptr_h = Dist_h, *ptr_d = Dist_d;
     int p2_sub;
 
-    cudaEventRecord(ev_2, stream[0]);
+    cudaEventRecord(ev_1, stream[0]);
     //printf("round 1\n");
     for(int i=1; i<Rounds; i++) {
         ptr_h += line_h;
         ptr_d += line_d;
+        cudaMemcpy2DAsync(ptr_d, pitch_bytes, ptr_h, b_rounds_bytes, b_rounds_bytes, block_size, cudaMemcpyHostToDevice, stream_m);
+        cudaEventCreateWithFlags(&ev_2, cudaEventDisableTiming);
+        cudaEventRecord(ev_2, stream_m);
+
         cudaStreamCreate(&stream[i]);
-        cudaMemcpy2DAsync(ptr_d, pitch_bytes, ptr_h, b_rounds_bytes, b_rounds_bytes, block_size, cudaMemcpyHostToDevice, stream[i]);
+        cudaStreamWaitEvent(stream[i], ev_1, 0);
         cudaStreamWaitEvent(stream[i], ev_2, 0);
 
         p2_start += line_d;
@@ -585,11 +634,11 @@ void block_FW_S()
         cal_phase1<<<1, threads, 0, stream[i]>>>(p1_start);
         cal_phase2_row<<<Rounds, threads, 0, stream[i]>>>(p1_start, i);
 
-        cudaEventRecord(ev_2, stream[i]);
+        cudaEventRecord(ev_1, stream[i]);
         for(int j=0; j<Rounds; j++) {
             if(i==j) continue;
 
-            cudaStreamWaitEvent(stream[j], ev_2, 0);
+            cudaStreamWaitEvent(stream[j], ev_1, 0);
 
             p2_sub = p1_start + line_d * (j - i);
             //printf("\tp1=(%d,%d), p2=(%d,%d) stream %d\n", ROW_COL(p1_start), ROW_COL(p2_sub), j);
@@ -606,6 +655,4 @@ void block_FW_S()
         ptr_h += line_n;
         ptr_d += line_d;
     }
-    cudaStreamCreate(&stream_s);
-    cudaEventCreate(&ev_1);
 }
