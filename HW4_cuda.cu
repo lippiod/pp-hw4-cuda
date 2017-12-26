@@ -19,6 +19,7 @@ const int V = 20010;
 const int block_size = 32;
 const int file_step = 10;
 const int write_size = 6;
+const int mem_round = 2;
 int max_streams = 4;
 int first_round = 4;
 
@@ -27,7 +28,7 @@ void block_FW(char *outfile);
 void block_FW_S(char *outFileName);
 void print();
 void split_strings(int m, char *sstart);
-void cuda_init();
+void cuda_init(int round);
 
 int n, n_bytes; // Number of vertices, edges
 int Rounds, b_rounds, b_rounds_bytes, dist_size, dist_size_bytes;
@@ -283,14 +284,15 @@ int main(int argc, char* argv[])
     gettimeofday(&start_time, NULL);
 
     input(argv[1]);
-    gettimeofday(&temp_time, NULL);
-    printf("input> %g s\n", CAL_TIME);
+    //gettimeofday(&temp_time, NULL);
+    //printf("input> %g s\n", CAL_TIME);
 
-    cuda_init();
 
     if(Rounds<=first_round) {
+        cuda_init(1);
         block_FW_S(argv[2]);
     } else {
+
         block_FW(argv[2]);
     }
 
@@ -311,15 +313,25 @@ void block_FW(char *outfile)
     int step_size = 0;
     int total = n * n;
 
+    //gettimeofday(&temp_time, NULL);
+    //printf("cuda 1> %g s\n", CAL_TIME);
+    cuda_init(mem_round);
+    //gettimeofday(&temp_time, NULL);
+    //printf("cuda 2> %g s\n", CAL_TIME);
+
     id[0] = 0;
+    //gettimeofday(&temp_time, NULL);
+    //printf("\tblock_FW start> %g s\n", CAL_TIME);
+
     //printf("round 1\n");
     for(int i=1; i<first_round; i++) {
         id[i] = i / 2;
         ptr_h += line_h;
         ptr_d += line_d;
-        cudaMemcpy2DAsync(ptr_d, pitch_bytes, ptr_h, b_rounds_bytes, b_rounds_bytes, block_size, cudaMemcpyHostToDevice, stream_m);
-        cudaEventCreateWithFlags(&ev_m, cudaEventDisableTiming);
-        cudaEventRecord(ev_m, stream_m);
+        if(i%mem_round==0) {
+            cudaMemcpy2DAsync(ptr_d, pitch_bytes, ptr_h, b_rounds_bytes, b_rounds_bytes, block_size * mem_round, cudaMemcpyHostToDevice, stream_m);
+            cudaEventRecord(ev_m, stream_m);
+        }
 
         cudaStreamCreate(&stream[i]);
         cudaStreamWaitEvent(stream[i], ev_1, 0);
@@ -493,17 +505,21 @@ void block_FW(char *outfile)
 }
 
 
-void cuda_init()
+void cuda_init(int round)
 {
     cudaStreamCreate(&stream_m);
-    cudaMemcpy2DAsync(Dist_d, pitch_bytes, Dist_h, b_rounds_bytes, b_rounds_bytes, block_size, cudaMemcpyHostToDevice);
+    cudaMemcpy2DAsync(Dist_d, pitch_bytes, Dist_h, b_rounds_bytes, b_rounds_bytes, block_size * round, cudaMemcpyHostToDevice, stream_m);
 
     line_h = block_size * b_rounds;
     line_d = block_size * pitch;
     line_n = block_size * n;
     diag_size = (pitch + 1) * block_size;
 
+    cudaEventCreateWithFlags(&ev_m, cudaEventDisableTiming);
+    cudaEventRecord(ev_m, stream_m);
+
     cudaStreamCreate(&stream[0]);
+    cudaStreamWaitEvent(stream[0], ev_m, 0);
     cal_phase1<<<1, threads, 0, stream[0]>>>(0);
     cudaEventCreateWithFlags(&ev_1, cudaEventDisableTiming);
     cudaEventRecord(ev_1, stream[0]);
@@ -558,12 +574,12 @@ void input(char *inFileName)
     for (int i = 0; i < dist_size; i+=b_rounds+1) {
         Dist_h[i] = 0;
     }
-    gettimeofday(&temp_time, NULL);
+    //gettimeofday(&temp_time, NULL);
     //printf("\tbefore> %g s\n", CAL_TIME);
 
     split_strings(m, next_tok);
 
-    gettimeofday(&temp_time, NULL);
+    //gettimeofday(&temp_time, NULL);
     //printf("\tafter> %g s\n", CAL_TIME);
 
 
@@ -638,7 +654,6 @@ void block_FW_S(char *outFileName)
         ptr_h += line_h;
         ptr_d += line_d;
         cudaMemcpy2DAsync(ptr_d, pitch_bytes, ptr_h, b_rounds_bytes, b_rounds_bytes, block_size, cudaMemcpyHostToDevice, stream_m);
-        cudaEventCreateWithFlags(&ev_m, cudaEventDisableTiming);
         cudaEventRecord(ev_m, stream_m);
 
         cudaStreamCreate(&stream[i]);
