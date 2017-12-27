@@ -5,6 +5,9 @@
 #include <cuda.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include <omp.h>
 
 #define CEIL(a, b) ( ((a) + (b) - 1) / (b) )
@@ -18,7 +21,7 @@ const int INF = 1000000000;
 const int V = 20010;
 const int block_size = 32;
 //const int file_step = 10;
-//const int write_size = 6;
+//const int write_size = 8;
 const int max_devices = 2;
 int max_streams = 4;
 int first_round = 4;
@@ -258,14 +261,15 @@ __global__ void cal_phase3_2(int p1_pivot, int p2_pivot, int r)
     //Dist[b2_index] = MIN(origin2, b2_dist);
 }
 
-int n, n_bytes; // Number of vertices, edges
+int n, n_bytes, out_size; // Number of vertices, edges
 int Rounds, b_rounds, b_rounds_bytes;
 int dist_size, dist_size_bytes;
-int line_h, line_n;
+int line_n;
 unsigned int *Dist_h;
 char buf[INF];
 char *fstr;
 FILE *outfile;
+int last_line;
 
 struct timeval start_time, temp_time;
 
@@ -281,13 +285,13 @@ int main(int argc, char* argv[])
     assert(argc==4);
     //block_size = atoi(argv[3]);
 
-    gettimeofday(&start_time, NULL);
+    //gettimeofday(&start_time, NULL);
 
+    outfile = fopen(argv[2], "w+");
     input(argv[1]);
-    gettimeofday(&temp_time, NULL);
-    printf("input> %g s\n", CAL_TIME);
+    //gettimeofday(&temp_time, NULL);
+    //printf("input> %g s\n", CAL_TIME);
 
-    outfile = fopen(argv[2], "w");
 #pragma omp parallel default(shared) num_threads(2)
     {
         int tid = omp_get_thread_num();
@@ -301,8 +305,8 @@ int main(int argc, char* argv[])
         }
     }
 
-    gettimeofday(&temp_time, NULL);
-    printf("block_FW> %g s\n", CAL_TIME);
+    //gettimeofday(&temp_time, NULL);
+    //printf("block_FW> %g s\n", CAL_TIME);
 
     return 0;
 }
@@ -311,7 +315,8 @@ int main(int argc, char* argv[])
 void cuda_init(int tid)
 {
     cudaDeviceEnablePeerAccess(tid^1, 0);
-    cudaMemcpy2DAsync(Dist_d[tid], pitch_bytes, Dist_h, b_rounds_bytes, b_rounds_bytes, block_size, cudaMemcpyHostToDevice);
+    cudaError_t e = cudaMemcpy2DAsync(Dist_d[tid], pitch_bytes, Dist_h, n_bytes, n_bytes, block_size, cudaMemcpyHostToDevice);
+    //fprintf(stderr, "memcpy -0 %s\n", cudaGetErrorString(e));
 
     cudaStreamCreate(&stream_m[tid]);
     cudaStreamCreate(&stream[tid][0]);
@@ -328,27 +333,26 @@ void cuda_init(int tid)
 
 void block_FW(int tid)
 {
-    int id_0[V], id_1[V], id_2[V];
+    int id_0[V], id_1[V];
     int p1_start = 0, p2_start = 0, p2_sub;
     unsigned int *ptr_h = Dist_h, *ptr_d = Dist_d[tid];
-    //unsigned int *ptr_f = Dist_h, step_size = 0;
-    //int cnt;
-    int flag;
-    int total = n * n, oid = tid ^ 1, offset;
+    //unsigned int step_size = 0;
+    //int cnt = 0, total = n * n;
+    int flag, bline = block_size;
+    int oid = tid ^ 1, offset;
     cudaStream_t *sp, s;
 
     cuda_init(tid);
 
-    id_0[0] = id_1[0] = id_2[0] = 0;
+    id_0[0] = id_1[0] = 0;
     //printf("Round 1: row < first_round (in pivot)\n");
     for(int i=1; i<first_round; i++) {
         sp = &stream[tid][i];
         id_0[i] = (i%4) / max_devices;
-        id_1[i] = i;
-        id_2[i] = i / 4;
-        ptr_h += line_h;
+        id_1[i] = i / 4;
+        ptr_h += line_n;
         ptr_d += line_d;
-        cudaMemcpy2DAsync(ptr_d, pitch_bytes, ptr_h, b_rounds_bytes, b_rounds_bytes, block_size, cudaMemcpyHostToDevice, stream_m[tid]);
+        cudaMemcpy2DAsync(ptr_d, pitch_bytes, ptr_h, n_bytes, n_bytes, block_size, cudaMemcpyHostToDevice, stream_m[tid]);
         cudaEventRecord(ev_m[tid], stream_m[tid]);
 
         cudaStreamCreate(sp);
@@ -386,37 +390,6 @@ void block_FW(int tid)
         }
     }
 
-    //printf("Round (1-first_round): other rows\n");
-    for(int i=first_round; i<Rounds; i++) {
-        id_0[i] = (i%4) / max_devices;
-        id_1[i] = i % max_streams;
-        id_2[i] = (i/4) % max_streams;
-        s = stream[tid][id_1[i]];
-
-        ptr_h += line_h;
-        ptr_d += line_d;
-        cudaMemcpy2DAsync(ptr_d, pitch_bytes, ptr_h, b_rounds_bytes, b_rounds_bytes, block_size, cudaMemcpyHostToDevice, stream_m[tid]);
-        cudaEventRecord(ev_m[tid], stream_m[tid]);
-        cudaStreamWaitEvent(s, ev_m[tid], 0);
-
-        p1_start = 0;
-        p2_start += line_d;
-        p2_sub = p2_start;
-        //printf("\nround %d seq\n", i);
-        for(int r=0; r<first_round; r++) {
-            //printf("\tp1=(%d,%d), p2=(%d,%d) stream %d\n", ROW_COL(p1_start), ROW_COL(p2_sub), s);
-
-            cal_phase2_blk<<< 1, threads, 0, s>>>(p1_start, p2_sub);
-            cal_phase3<<<Rounds, threads, 0, s>>>(p1_start, p2_sub, r);
-            p1_start += diag_size;
-            p2_sub += block_size;
-        }
-        if(i==first_round) {
-            cudaStreamCreate(&stream_s[tid]);
-            cudaEventRecord(ev_1[tid], s);
-            cudaStreamWaitEvent(stream_s[tid], ev_1[tid], 0);
-        }
-    }
     for(int i=0; i<max_streams; i++) {
         cudaEventRecord(ev_1[tid], stream[tid][i]);
         for(int j=0; j<max_streams; j++) {
@@ -425,6 +398,39 @@ void block_FW(int tid)
         }
     }
 
+    //printf("Round (1-first_round): other rows\n");
+    for(int i=first_round; i<Rounds; i++) {
+        id_0[i] = (i%4) / max_devices;
+        id_1[i] = (i/4) % max_streams;
+        s = stream[tid][id_1[i]];
+
+        ptr_h += line_n;
+        ptr_d += line_d;
+        p2_start += line_d;
+        if(i==first_round || id_0[i]==tid) {
+            bline = i==Rounds-1 ? last_line : block_size;
+            cudaMemcpy2DAsync(ptr_d, pitch_bytes, ptr_h, n_bytes, n_bytes, bline, cudaMemcpyHostToDevice, stream_m[tid]);
+            cudaEventRecord(ev_m[tid], stream_m[tid]);
+            cudaStreamWaitEvent(s, ev_m[tid], 0);
+
+            p1_start = 0;
+            p2_sub = p2_start;
+            //printf("\nround %d seq\n", i);
+            for(int r=0; r<first_round; r++) {
+                //printf("\tp1=(%d,%d), p2=(%d,%d) stream %d\n", ROW_COL(p1_start), ROW_COL(p2_sub), s);
+
+                cal_phase2_blk<<< 1, threads, 0, s>>>(p1_start, p2_sub);
+                cal_phase3<<<Rounds, threads, 0, s>>>(p1_start, p2_sub, r);
+                p1_start += diag_size;
+                p2_sub += block_size;
+            }
+            if(i==first_round) {
+                cudaStreamCreate(&stream_s[tid]);
+                cudaEventRecord(ev_1[tid], s);
+                cudaStreamWaitEvent(stream_s[tid], ev_1[tid], 0);
+            }
+        }
+    }
 
     //printf("R %d\n", Rounds);
     for (int r=first_round; r<Rounds; ++r) {
@@ -432,30 +438,28 @@ void block_FW(int tid)
 
         if(id_0[r]==oid)
             cudaStreamWaitEvent(stream_s[tid], ev_m[oid], 0);
-        //cudaStreamWaitEvent(stream[tid][id_2[r-1]], ev_2[tid], 0);
+        //cudaStreamWaitEvent(stream[tid][id_1[r-1]], ev_2[tid], 0);
         cal_phase1<<<1, threads, 0, stream_s[tid]>>>(p1_start);
         cudaEventRecord(ev_1[tid], stream_s[tid]);
+
         cal_phase2_row<<<Rounds, threads, 0, stream_s[tid]>>>(p1_start, r);
         cudaEventRecord(ev_2[tid], stream_s[tid]);
 
-        if(r==Rounds-1)
-#pragma omp single
+        if(r==Rounds-1 && tid==1)
         {
             ptr_h = Dist_h + r * line_n;
             ptr_d = Dist_d[tid] + r * line_d;
             cudaStreamWaitEvent(stream_m[tid], ev_2[tid], 0);
-            cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, block_size, cudaMemcpyDeviceToHost, stream_m[tid]);
-            //cnt++;
+            cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, n - r*block_size, cudaMemcpyDeviceToHost, stream_m[tid]);
+            //cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, last_line, cudaMemcpyDeviceToHost);
         }
 
         //printf("r %d\n", r);
         flag = 1;
         for(int i = (r+1) % Rounds; i != r; i = (i==Rounds-1) ? 0 : i+1) {
-            //if(r==Rounds-1)
-                //fprintf(stderr, "%d %d %d\n", tid, i, id_0[i]);
             if(id_0[i]==oid) continue;
 
-            s = stream[tid][id_2[i]];
+            s = stream[tid][id_1[i]];
             p2_start = p1_start + line_d * (i-r);
             if(flag>0) {
                 if(i+1==Rounds || i+1==r || id_0[i+1]==oid) {
@@ -474,33 +478,15 @@ void block_FW(int tid)
                 }
 
                 if(r==Rounds-1) {
+
                     cudaEventRecord(ev_1[tid], s);
                     cudaStreamWaitEvent(stream_m[tid], ev_1[tid], 0);
 
+                    bline = flag==0 ? block_size * 2 : block_size;
                     ptr_d = Dist_d[tid] + i * line_d;
                     ptr_h = Dist_h + i * line_n;
-                    cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, block_size, cudaMemcpyDeviceToHost, stream_m[tid]);
-                    //cnt++;
-                    if(flag<=0) {
-                        ptr_d += line_d;
-                        ptr_h += line_n;
-                        cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, block_size, cudaMemcpyDeviceToHost, stream_m[tid]);
-                        //cnt++;
-                    }
-/*
-                    if(cnt>=file_step) {
-                        if(step_size>0) {
-                            //printf("%d\n", i);
-                            total -= step_size;
-                            cudaEventSynchronize(ev_m[tid]);
-                            fwrite(ptr_f, sizeof(int), step_size, outfile);
-                            ptr_f += step_size;
-                        }
-                        step_size = write_size * line_n;
-                        cnt = 0;
-                        cudaEventRecord(ev_m[tid], stream_m[tid]);
-                    }
-*/
+                    cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, bline, cudaMemcpyDeviceToHost, stream_m[tid]);
+
                 }
             } else {
                 flag++;
@@ -517,36 +503,23 @@ void block_FW(int tid)
         }
         p1_start += diag_size;
     }
-/*
-    if(step_size>0) {
-        total -= step_size;
-        cudaEventSynchronize(ev_m[tid]);
-        fwrite(ptr_f, sizeof(int), step_size, outfile);
-        ptr_f += step_size;
-    }
 
-    cudaEventRecord(ev_m[tid], stream_m[tid]);
-    cudaEventSynchronize(ev_m[tid]);
-    fwrite(ptr_f, sizeof(int), total, outfile);
-    fclose(outfile);
-*/
-    //fprintf(stderr, "%d %d %d\n", tid, Rounds, cnt);
-
-    //gettimeofday(&temp_time, NULL);
-    //printf("input> %g s\n", CAL_TIME);
 #pragma omp sections
     {
 #pragma omp section
         {
+            //fprintf(stderr, "%d %d fwrite %d remain\n", omp_get_thread_num(), ptr_f - Dist_h, total);
             for(int d=0; d<max_devices; d++) {
                 cudaSetDevice(d);
                 cudaDeviceSynchronize();
             }
-            fwrite(Dist_h, sizeof(int), total, outfile);
-            cudaFreeHost(Dist_h);
+            msync(Dist_h, out_size, MS_SYNC);
+            munmap(Dist_h, out_size);
+            fclose(outfile);
         }
 #pragma omp section
         {
+            //fprintf(stderr, "%d %d cuda\n", omp_get_thread_num(), ptr_f - Dist_h);
             for(int d=0; d<max_devices; d++) {
                 cudaSetDevice(d);
                 cudaDeviceSynchronize();
@@ -554,8 +527,8 @@ void block_FW(int tid)
                     cudaStreamDestroy(stream[d][i]);
                 }
                 cudaStreamDestroy(stream_s[d]);
-                cudaEventDestroy(ev_1[d]);
                 cudaStreamDestroy(stream_m[d]);
+                cudaEventDestroy(ev_1[d]);
                 cudaEventDestroy(ev_2[d]);
                 cudaEventDestroy(ev_m[d]);
 
@@ -588,34 +561,67 @@ void input(char *inFileName)
     b_rounds = block_size * Rounds;
     b_rounds_bytes = b_rounds * sizeof(int);
 
-    gettimeofday(&temp_time, NULL);
-    printf("before parsing> %g s\n", CAL_TIME);
+    //gettimeofday(&temp_time, NULL);
+    //printf("before parsing> %g s\n", CAL_TIME);
 #pragma omp parallel default(shared) private(temp_time) num_threads(2)
     {
 #pragma omp sections
         {
 #pragma omp section
             {
+                int fd = fileno(outfile);
                 fstr = sz<INF ? buf : (char *) malloc(sz+10);
                 fsize = fread(fstr, sizeof(char), sz+10, infile);
                 fclose(infile);
                 fstr[fsize] = '\0';
 
-                dist_size = b_rounds * b_rounds;
-                dist_size_bytes = dist_size * sizeof(int);
-                cudaMallocHost(&Dist_h, dist_size_bytes);
-                memset(Dist_h, 64, dist_size_bytes);
-                for (int i = 0; i < dist_size; i+=b_rounds+1) {
+                //cudaMallocHost(&Dist_h, dist_size_bytes);
+                n_bytes = n * sizeof(int);
+                last_line = n - (Rounds-1) * block_size;
+                out_size = n * n_bytes;
+                ftruncate(fd, out_size);
+
+                //gettimeofday(&temp_time, NULL);
+                //printf("\tmmap 0> %g s\n", CAL_TIME);
+
+                Dist_h = (unsigned int *) mmap(NULL, out_size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, fd, 0);
+                if(Dist_h==MAP_FAILED) {
+                    fprintf(stderr, "mmap faild 1\n");
+                    exit(1);
+                }
+                //gettimeofday(&temp_time, NULL);
+                //printf("\tmmap 1> %g s\n", CAL_TIME);
+/*
+                Dist_h = (unsigned int *) mmap(Dist_h, out_size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE|MAP_FIXED, fd, 0);
+                if(Dist_h==MAP_FAILED) {
+                    fprintf(stderr, "mmap faild 2\n");
+                    exit(1);
+                }
+*/
+                //gettimeofday(&temp_time, NULL);
+                //printf("\tmmap 2> %g s\n", CAL_TIME);
+                //fprintf(stderr, "mmap success %d\n", Dist_h);
+
+                //cudaError_t e = cudaHostRegister(Dist_h, out_size, cudaHostRegisterPortable);
+                //fprintf(stderr, "HostReg %s\n", cudaGetErrorString(e));
+                memset(Dist_h, 64, out_size);
+                for (int i = 0; i < n*n; i+=n+1) {
                     Dist_h[i] = 0;
                 }
+                //fprintf(stderr, "memset success\n");
 
-                gettimeofday(&temp_time, NULL);
-                printf("\tfile read done> %g s\n", CAL_TIME);
+                //gettimeofday(&temp_time, NULL);
+                //printf("\tfile read done> %g s\n", CAL_TIME);
+
+                split_strings(fstr);
+                if(sz>=INF)
+                    free(fstr);
+
+                //gettimeofday(&temp_time, NULL);
+                //printf("\tparsing done> %g s\n", CAL_TIME);
             }
 #pragma omp section
             {
-                n_bytes = n * sizeof(int);
-                line_h = block_size * b_rounds;
                 line_n = block_size * n;
                 if(n>=10000) {
                     max_streams = 6;
@@ -634,17 +640,14 @@ void input(char *inFileName)
                     diag_size = (pitch + 1) * block_size;
                     cudaMemcpyToSymbolAsync(Dist, &Dist_d[d], sizeof(Dist_d[d]), 0);
                     cudaMemcpyToSymbolAsync(pitch_d, &pitch, sizeof(pitch), 0);
+                    cudaMemset2DAsync(Dist_d[d], pitch_bytes, 64, b_rounds_bytes, b_rounds);
                 }
 
-                gettimeofday(&temp_time, NULL);
-                printf("\tcuda allocate done> %g s\n", CAL_TIME);
+                //gettimeofday(&temp_time, NULL);
+                //printf("\tcuda allocate done> %g s\n", CAL_TIME);
             }
         }
     }
-    split_strings(fstr);
-
-    if(sz>=INF)
-        free(fstr);
 }
 
 void split_strings(char *ptr)
@@ -696,7 +699,7 @@ void split_strings(char *ptr)
             ptr += 4;
         }
 
-        Dist_h[ b_rounds * a + b ] = v;
+        Dist_h[ n * a + b ] = v;
     }
 }
 
@@ -704,15 +707,16 @@ void block_FW_S(int tid)
 {
     int p1_start = 0, p2_start = 0, offset;
     unsigned int *ptr_h = Dist_h, *ptr_d = Dist_d[tid];
-    int p2_sub;
+    int p2_sub, bline;
 
     cuda_init(tid);
 
     //printf("round 1\n");
     for(int i=1; i<Rounds; i++) {
-        ptr_h += line_h;
+        ptr_h += line_n;
         ptr_d += line_d;
-        cudaMemcpy2DAsync(ptr_d, pitch_bytes, ptr_h, b_rounds_bytes, b_rounds_bytes, block_size, cudaMemcpyHostToDevice, stream_m[tid]);
+        bline = i==Rounds-1 ? n - i * block_size : block_size;
+        cudaMemcpy2DAsync(ptr_d, pitch_bytes, ptr_h, n_bytes, n_bytes, bline, cudaMemcpyHostToDevice, stream_m[tid]);
         cudaEventRecord(ev_m[tid], stream_m[tid]);
 
         cudaStreamCreate(&stream[tid][i]);
@@ -765,7 +769,9 @@ void block_FW_S(int tid)
     for(int i=tid; i<Rounds; i+=2) {
         ptr_h = Dist_h + i * line_n;
         ptr_d = Dist_d[tid] + i * line_d;
-        cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, block_size, cudaMemcpyDeviceToHost, stream[tid][i]);
+        bline = i==Rounds-1 ? last_line : block_size;
+        cudaError_t e = cudaMemcpy2DAsync(ptr_h, n_bytes, ptr_d, pitch_bytes, n_bytes, bline, cudaMemcpyDeviceToHost, stream[tid][i]);
+        //fprintf(stderr, "memcpy %d %s\n", i, cudaGetErrorString(e));
     }
     if(Rounds==1)
         cudaMemcpy2DAsync(Dist_h, n_bytes, Dist_d[tid], pitch_bytes, n_bytes, block_size, cudaMemcpyDeviceToHost);
@@ -782,11 +788,11 @@ void block_FW_S(int tid)
 #pragma omp section
         {
             //fprintf(stderr, "%d - write file\n", tid);
-            fwrite(Dist_h, sizeof(int), n*n, outfile);
+            msync(Dist_h, out_size, MS_SYNC);
+            munmap(Dist_h, out_size);
             fclose(outfile);
-            cudaFreeHost(Dist_h);
 
-            gettimeofday(&temp_time, NULL);
+            //gettimeofday(&temp_time, NULL);
             //printf("\twrite done> %g s\n", CAL_TIME);
         }
 #pragma omp section
@@ -804,7 +810,7 @@ void block_FW_S(int tid)
                 cudaFree(Dist_d[d]);
             }
 
-            gettimeofday(&temp_time, NULL);
+            //gettimeofday(&temp_time, NULL);
             //printf("\tcuda free done> %g s\n", CAL_TIME);
         }
     }
