@@ -68,8 +68,8 @@ __global__ void cal_phase1(int pivot)
 
 __global__ void cal_phase2_row(int pivot, int r)
 {
-    __shared__ unsigned int block_dist[block_size][block_size];
-    __shared__ unsigned int pivot_dist[block_size][block_size];
+    __shared__ unsigned int block_dist[block_size][block_size+1];
+    __shared__ unsigned int pivot_dist[block_size][block_size+1];
 
     int tx = threadIdx.x, ty = threadIdx.y;
     int tid = ty * pitch_d + tx;
@@ -81,7 +81,7 @@ __global__ void cal_phase2_row(int pivot, int r)
 
     if(blockIdx.x==r) // pivot block
         return;
-
+/*
     block_index = pivot_index + column;
     block_dist[ty][tx] = origin = Dist[block_index];
     __syncthreads();
@@ -106,6 +106,27 @@ __global__ void cal_phase2_row(int pivot, int r)
         Dist[block_index] = new_dist;
     else if(origin > blk_dist)
         Dist[block_index] = blk_dist;
+*/
+    pivot_dist[ty][tx] = Dist[pivot_index];
+    block_index = pivot_index + column;
+    block_dist[tx][ty] = origin = Dist[block_index];
+    __syncthreads();
+
+    if(origin > INF)
+        Dist[block_index] = origin = INF;
+
+    blk_dist = block_dist[ty][tx];
+    for(int k=0; k<block_size; k++) {
+        new_dist = pivot_dist[tx][k] + block_dist[ty][k];
+
+        if (blk_dist > new_dist)
+            block_dist[ty][tx] = blk_dist = new_dist;
+    }
+    __syncthreads();
+
+    blk_dist = block_dist[tx][ty];
+    if(origin > blk_dist)
+        Dist[block_index] = blk_dist;
 }
 
 __global__ void cal_phase2_blk(int p1_pivot, int p2_pivot)
@@ -119,10 +140,10 @@ __global__ void cal_phase2_blk(int p1_pivot, int p2_pivot)
     unsigned int origin, blk_dist, new_dist;
 
     pivot_dist[ty][tx] = Dist[p1_pivot + tid];
+    __syncthreads();
 
     block_index = p2_pivot + tid + blockIdx.x * pitch_d * block_size;
     block_dist[ty][tx] = origin = Dist[block_index];
-    __syncthreads();
 
     blk_dist = origin;
     for(int k=0; k<block_size-1; k++) {
@@ -132,7 +153,6 @@ __global__ void cal_phase2_blk(int p1_pivot, int p2_pivot)
             //block_dist[ty][tx] = new_dist;
         if(blk_dist > new_dist)
             block_dist[ty][tx] = blk_dist = new_dist;
-        __syncthreads();
     }
     new_dist = block_dist[ty][block_size-1] + pivot_dist[block_size-1][tx];
     if(blk_dist > new_dist)
@@ -473,7 +493,6 @@ void block_FW()
 
     //printf("R %d\n", Rounds);
     for (int r=first_round; r<Rounds; ++r) {
-        MPI_Barrier(MPI_COMM_WORLD);
         if(r>first_round) {
             if(id_0[r]==mpi_rank) {
                 cudaEventSynchronize(ev_m);

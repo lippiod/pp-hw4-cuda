@@ -71,8 +71,8 @@ __global__ void cal_phase1(int pivot)
 
 __global__ void cal_phase2_row(int pivot, int r)
 {
-    __shared__ unsigned int block_dist[block_size][block_size];
-    __shared__ unsigned int pivot_dist[block_size][block_size];
+    __shared__ unsigned int block_dist[block_size][block_size+1];
+    __shared__ unsigned int pivot_dist[block_size][block_size+1];
 
     int tx = threadIdx.x, ty = threadIdx.y;
     int tid = ty * pitch_d + tx;
@@ -84,7 +84,7 @@ __global__ void cal_phase2_row(int pivot, int r)
 
     if(blockIdx.x==r) // pivot block
         return;
-
+/*
     block_index = pivot_index + column;
     block_dist[ty][tx] = origin = Dist[block_index];
     __syncthreads();
@@ -109,6 +109,27 @@ __global__ void cal_phase2_row(int pivot, int r)
         Dist[block_index] = new_dist;
     else if(origin > blk_dist)
         Dist[block_index] = blk_dist;
+*/
+    pivot_dist[ty][tx] = Dist[pivot_index];
+    block_index = pivot_index + column;
+    block_dist[tx][ty] = origin = Dist[block_index];
+    __syncthreads();
+
+    if(origin > INF)
+        Dist[block_index] = origin = INF;
+
+    blk_dist = block_dist[ty][tx];
+    for(int k=0; k<block_size; k++) {
+        new_dist = pivot_dist[tx][k] + block_dist[ty][k];
+
+        if (blk_dist > new_dist)
+            block_dist[ty][tx] = blk_dist = new_dist;
+    }
+    __syncthreads();
+
+    blk_dist = block_dist[tx][ty];
+    if(origin > blk_dist)
+        Dist[block_index] = blk_dist;
 }
 
 __global__ void cal_phase2_blk(int p1_pivot, int p2_pivot)
@@ -122,10 +143,10 @@ __global__ void cal_phase2_blk(int p1_pivot, int p2_pivot)
     unsigned int origin, blk_dist, new_dist;
 
     pivot_dist[ty][tx] = Dist[p1_pivot + tid];
+    __syncthreads();
 
     block_index = p2_pivot + tid + blockIdx.x * pitch_d * block_size;
     block_dist[ty][tx] = origin = Dist[block_index];
-    __syncthreads();
 
     blk_dist = origin;
     for(int k=0; k<block_size-1; k++) {
@@ -135,7 +156,6 @@ __global__ void cal_phase2_blk(int p1_pivot, int p2_pivot)
             //block_dist[ty][tx] = new_dist;
         if(blk_dist > new_dist)
             block_dist[ty][tx] = blk_dist = new_dist;
-        __syncthreads();
     }
     new_dist = block_dist[ty][block_size-1] + pivot_dist[block_size-1][tx];
     if(blk_dist > new_dist)
@@ -279,7 +299,7 @@ int main(int argc, char* argv[])
     outfile = fopen(argv[2], "w+");
     input(argv[1]);
     gettimeofday(&temp_time, NULL);
-    printf("input> %g s\n", CAL_TIME);
+    //fprintf(stderr, "input> %g s\n", CAL_TIME);
 
 #pragma omp parallel default(shared) num_threads(2)
     {
@@ -295,7 +315,7 @@ int main(int argc, char* argv[])
     }
 
     gettimeofday(&temp_time, NULL);
-    printf("block_FW> %g s\n", CAL_TIME);
+    //fprintf(stderr, "block_FW> %g s\n", CAL_TIME);
 
     return 0;
 }
@@ -523,20 +543,34 @@ void block_FW(int tid)
 #pragma omp section
         {
             //fprintf(stderr, "%d %d cuda\n", omp_get_thread_num(), ptr_f - Dist_h);
-            for(int d=0; d<max_devices; d++) {
-                cudaSetDevice(d);
-                cudaDeviceSynchronize();
-                for(int i=0; i<max_streams; i++) {
-                    cudaStreamDestroy(stream[d][i]);
-                }
-                cudaStreamDestroy(stream_s[d]);
-                cudaStreamDestroy(stream_m[d]);
-                cudaEventDestroy(ev_1[d]);
-                cudaEventDestroy(ev_2[d]);
-                cudaEventDestroy(ev_m[d]);
-
-                cudaFree(Dist_d[d]);
+            cudaSetDevice(0);
+            cudaDeviceSynchronize();
+            for(int i=0; i<max_streams; i++) {
+                cudaStreamDestroy(stream[0][i]);
             }
+            cudaStreamDestroy(stream_s[0]);
+            cudaStreamDestroy(stream_m[0]);
+            cudaEventDestroy(ev_1[0]);
+            cudaEventDestroy(ev_2[0]);
+            cudaEventDestroy(ev_m[0]);
+
+            cudaFree(Dist_d[0]);
+        }
+#pragma omp section
+        {
+            //fprintf(stderr, "%d %d cuda\n", omp_get_thread_num(), ptr_f - Dist_h);
+            cudaSetDevice(1);
+            cudaDeviceSynchronize();
+            for(int i=0; i<max_streams; i++) {
+                cudaStreamDestroy(stream[1][i]);
+            }
+            cudaStreamDestroy(stream_s[1]);
+            cudaStreamDestroy(stream_m[1]);
+            cudaEventDestroy(ev_1[1]);
+            cudaEventDestroy(ev_2[1]);
+            cudaEventDestroy(ev_m[1]);
+
+            cudaFree(Dist_d[1]);
         }
     }
 }
@@ -573,7 +607,7 @@ void input(char *inFileName)
     b_rounds_bytes = b_rounds * sizeof(int);
 
     gettimeofday(&temp_time, NULL);
-    printf("before parsing> %g s\n", CAL_TIME);
+    fprintf(stderr, "before parsing> %g s\n", CAL_TIME);
 #pragma omp parallel default(shared) private(temp_time)
     {
 #pragma omp sections
@@ -608,7 +642,7 @@ void input(char *inFileName)
                 fclose(infile);
 
                 gettimeofday(&temp_time, NULL);
-                printf("\tparsing done (%d)> %g s\n", omp_get_thread_num(), CAL_TIME);
+                fprintf(stderr, "\tparsing done (%d)> %g s\n", omp_get_thread_num(), CAL_TIME);
             }
 #pragma omp section
             {
@@ -619,7 +653,7 @@ void input(char *inFileName)
                 }
                 max_row = (Rounds+max_streams*2-1) / (max_streams * 2);
                 //max_row = Rounds;
-                fprintf(stderr, "n %d, Rounds %d, streams %d, rows %d\n", n, Rounds, max_streams, max_row);
+                //fprintf(stderr, "n %d, Rounds %d, streams %d, rows %d\n", n, Rounds, max_streams, max_row);
                 cudaSetDevice(0);
                 cudaMallocPitch(&Dist_d[0], &p_bytes[0], b_rounds_bytes, b_rounds);
                 pitch_bytes = p_bytes[0];
@@ -632,7 +666,7 @@ void input(char *inFileName)
                 cudaMemset2DAsync(Dist_d[0], pitch_bytes, 64, b_rounds_bytes, b_rounds);
 
                 gettimeofday(&temp_time, NULL);
-                printf("\tcuda allocate done (%d)> %g s\n", omp_get_thread_num(), CAL_TIME);
+                fprintf(stderr, "\tcuda allocate done (%d)> %g s\n", omp_get_thread_num(), CAL_TIME);
             }
 #pragma omp section
             {
@@ -647,7 +681,7 @@ void input(char *inFileName)
                 cudaMemset2DAsync(Dist_d[1], pitch_bytes, 64, b_rounds_bytes, b_rounds);
 
                 gettimeofday(&temp_time, NULL);
-                printf("\tcuda allocate done (%d)> %g s\n", omp_get_thread_num(), CAL_TIME);
+                fprintf(stderr, "\tcuda allocate done (%d)> %g s\n", omp_get_thread_num(), CAL_TIME);
             }
         }
     }
@@ -782,43 +816,59 @@ void block_FW_S(int tid)
     } else if(tid==0) {
         cudaMemcpy2DAsync(Dist_h, n_bytes, Dist_d[tid], pitch_bytes, n_bytes, n, cudaMemcpyDeviceToHost);
     }
-
-    for(int d=0; d<max_devices; d++) {
-        cudaSetDevice(d);
-        cudaDeviceSynchronize();
-    }
+#pragma omp barrier
 
     gettimeofday(&temp_time, NULL);
-    //printf("before output> %g s\n", CAL_TIME);
+    fprintf(stderr, "before output> %g s\n", CAL_TIME);
 #pragma omp sections
     {
 #pragma omp section
         {
+            for(int d=0; d<max_devices; d++) {
+                cudaSetDevice(d);
+                cudaDeviceSynchronize();
+            }
             //fprintf(stderr, "%d - write file\n", tid);
             msync(Dist_h, out_size, MS_SYNC);
             munmap(Dist_h, out_size);
             fclose(outfile);
 
-            //gettimeofday(&temp_time, NULL);
-            //printf("\twrite done> %g s\n", CAL_TIME);
+            gettimeofday(&temp_time, NULL);
+            fprintf(stderr, "\twrite done> %g s\n", CAL_TIME);
         }
 #pragma omp section
         {
             //fprintf(stderr, "%d - cleanup\n", tid);
-            for(int d=0; d<max_devices; d++) {
-                cudaSetDevice(d);
-                cudaStreamDestroy(stream_m[d]);
-                for(int i=0; i<Rounds; i++) {
-                    cudaStreamDestroy(stream[d][i]);
-                }
-                cudaEventDestroy(ev_1[d]);
-                cudaEventDestroy(ev_2[d]);
-                cudaEventDestroy(ev_m[d]);
-                cudaFree(Dist_d[d]);
+            cudaSetDevice(0);
+            cudaDeviceSynchronize();
+            cudaStreamDestroy(stream_m[0]);
+            for(int i=0; i<Rounds; i++) {
+                cudaStreamDestroy(stream[0][i]);
             }
+            cudaEventDestroy(ev_1[0]);
+            cudaEventDestroy(ev_2[0]);
+            cudaEventDestroy(ev_m[0]);
+            cudaFree(Dist_d[0]);
 
-            //gettimeofday(&temp_time, NULL);
-            //printf("\tcuda free done> %g s\n", CAL_TIME);
+            gettimeofday(&temp_time, NULL);
+            fprintf(stderr, "\tcuda free done (0)> %g s\n", CAL_TIME);
+        }
+#pragma omp section
+        {
+            //fprintf(stderr, "%d - cleanup\n", tid);
+            cudaSetDevice(1);
+            cudaDeviceSynchronize();
+            cudaStreamDestroy(stream_m[1]);
+            for(int i=0; i<Rounds; i++) {
+                cudaStreamDestroy(stream[1][i]);
+            }
+            cudaEventDestroy(ev_1[1]);
+            cudaEventDestroy(ev_2[1]);
+            cudaEventDestroy(ev_m[1]);
+            cudaFree(Dist_d[1]);
+
+            gettimeofday(&temp_time, NULL);
+            fprintf(stderr, "\tcuda free done (1)> %g s\n", CAL_TIME);
         }
     }
 }
